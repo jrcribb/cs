@@ -496,8 +496,15 @@ The MCP server exposes two tools:
 | `case_sensitive` | boolean | no | Case sensitive search                                                                            |
 | `include_ext` | string | no | Comma-separated file extensions (e.g. `go,js,py`)                                                |
 | `language` | string | no | Comma-separated language types (e.g. `Go,Python`)                                                |
+| `path` | string | no | Restrict to files whose full path matches (substring or glob; comma-separated values are ORed). ANDed against the whole query |
+| `file` | string | no | Restrict to files whose filename matches (substring or glob; comma-separated values are ORed). ANDed against the whole query |
 | `gravity` | string | no | Complexity gravity intent: `brain`, `logic`, `default`, `low`, `off`                             |
 | `profile` | string | no | Ranking profile: `balanced` (default), `precise`, `broad` - overrides gravity/noise/test-penalty |
+
+The `path`, `file`, `include_ext`, and `language` parameters apply to the whole query and are the robust way to
+scope a search — unlike in-query filters (`path:`, `file:`, `ext:`, `lang:`), which bind only to the adjacent term
+(`a OR b path:src` means `a OR (b AND path:src)`). Note there is no top-level `ext` parameter; use `include_ext`.
+Unknown parameters are rejected with an error rather than silently ignored.
 
 Results are returned as JSON with the same fields as `--format json`: filename, location, score, snippet content, match locations, language, and code statistics.
 

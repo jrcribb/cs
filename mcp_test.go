@@ -274,6 +274,208 @@ func TestMCPSearchHandlerNoTruncation(t *testing.T) {
 	}
 }
 
+func TestMCPSearchHandlerRejectsUnknownParam(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Directory = t.TempDir()
+	cache := NewSearchCache()
+	handler := mcpSearchHandler(&cfg, cache)
+
+	// Reproduces the reported bug: caller passes non-existent top-level
+	// "path" and "ext" keys. These must be rejected, not silently dropped.
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{
+		"query": "classic migration backup bootstrap",
+		"path":  "projects/desktop-raycast/packages/node-backend/src",
+		"ext":   "ts",
+	}
+	result, err := handler(context.Background(), req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.IsError {
+		t.Fatal("expected error result for unknown parameter")
+	}
+	text := result.Content[0].(mcp.TextContent).Text
+	if !strings.Contains(text, "ext") {
+		t.Errorf("expected error to name the unknown 'ext' parameter, got: %s", text)
+	}
+	if !strings.Contains(text, "include_ext") {
+		t.Errorf("expected error to point to 'include_ext', got: %s", text)
+	}
+}
+
+func TestMCPSearchHandlerAcceptsKnownParams(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Directory = t.TempDir()
+	cache := NewSearchCache()
+	handler := mcpSearchHandler(&cfg, cache)
+
+	// "path" is a valid top-level param — this must not be rejected.
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{
+		"query": "anything",
+		"path":  "src",
+		"file":  "*.go",
+	}
+	result, err := handler(context.Background(), req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("unexpected error result for valid params: %v", result.Content[0].(mcp.TextContent).Text)
+	}
+}
+
+func TestMCPSearchHandlerTopLevelPathScopesGlobally(t *testing.T) {
+	dir := t.TempDir()
+	// Two dirs. Only "wanted" should survive a path filter, even though the
+	// query uses OR (which would leak "other" matches via in-query precedence).
+	for _, sub := range []string{"wanted", "other"} {
+		if err := os.MkdirAll(filepath.Join(dir, sub), 0755); err != nil {
+			t.Fatal(err)
+		}
+		content := "package main\n\nfunc f() {\n\t// alphatoken betatoken\n}\n"
+		if err := os.WriteFile(filepath.Join(dir, sub, "f.go"), []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cfg := DefaultConfig()
+	cfg.Directory = dir
+	cache := NewSearchCache()
+	handler := mcpSearchHandler(&cfg, cache)
+
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{
+		"query": "alphatoken OR betatoken",
+		"path":  "wanted",
+	}
+	result, err := handler(context.Background(), req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("unexpected error result: %v", result.Content[0].(mcp.TextContent).Text)
+	}
+	var parsed mcpSearchResponse
+	if err := json.Unmarshal([]byte(result.Content[0].(mcp.TextContent).Text), &parsed); err != nil {
+		t.Fatalf("result is not valid JSON: %v", err)
+	}
+	if parsed.TotalMatches != 1 {
+		t.Fatalf("expected exactly 1 match under 'wanted', got %d", parsed.TotalMatches)
+	}
+	if !strings.Contains(parsed.Results[0].Location, filepath.Join("wanted", "f.go")) {
+		t.Errorf("expected match in wanted/f.go, got %s", parsed.Results[0].Location)
+	}
+}
+
+func TestComposeSearchQuery(t *testing.T) {
+	cases := []struct {
+		name             string
+		query, path, fil string
+		want             string
+	}{
+		{"none", "foo OR bar", "", "", "foo OR bar"},
+		{"path", "foo OR bar", "src", "", "(foo OR bar) path:src"},
+		{"file", "foo", "", "*.go", "(foo) file:*.go"},
+		{"both", "foo", "src", "*.go", "(foo) path:src file:*.go"},
+		{"multi-path ORed", "foo", "src,internal", "", "(foo) (path:src OR path:internal)"},
+		{"trims and skips empties", "foo", " src , ", "", "(foo) path:src"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := composeSearchQuery(tc.query, tc.path, tc.fil); got != tc.want {
+				t.Errorf("composeSearchQuery(%q, %q, %q) = %q, want %q", tc.query, tc.path, tc.fil, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestAndedKeywordsForHint(t *testing.T) {
+	cases := []struct {
+		name  string
+		query string
+		want  []string
+	}{
+		{"multi keyword AND", "database init startup sequence", []string{"database", "init", "startup", "sequence"}},
+		{"single keyword", "database", nil},
+		{"has OR", "database OR init OR startup", nil},
+		{"grouped OR", "(database OR init) startup", nil},
+		{"phrase not counted", `"database init"`, nil},
+		{"regex not counted", `/func\s+init/`, nil},
+		{"negated excluded", "database NOT init", nil},
+		{"keywords plus filter still hints", "database init path:src", []string{"database", "init"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := andedKeywordsForHint(tc.query)
+			if len(got) != len(tc.want) {
+				t.Fatalf("andedKeywordsForHint(%q) = %v, want %v", tc.query, got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("andedKeywordsForHint(%q) = %v, want %v", tc.query, got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+func TestMCPSearchHandlerEmptyResultAndHint(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Directory = t.TempDir() // empty dir → guaranteed zero matches
+	cache := NewSearchCache()
+	handler := mcpSearchHandler(&cfg, cache)
+
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{
+		"query": "performStartupStep database init startup sequence",
+	}
+	result, err := handler(context.Background(), req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("unexpected error result: %v", result.Content[0].(mcp.TextContent).Text)
+	}
+	var parsed mcpSearchResponse
+	if err := json.Unmarshal([]byte(result.Content[0].(mcp.TextContent).Text), &parsed); err != nil {
+		t.Fatalf("result is not valid JSON: %v", err)
+	}
+	if parsed.TotalMatches != 0 {
+		t.Fatalf("expected 0 matches, got %d", parsed.TotalMatches)
+	}
+	if !strings.Contains(parsed.Message, "ANDed") {
+		t.Errorf("expected an AND-explanation hint, got: %q", parsed.Message)
+	}
+	if !strings.Contains(parsed.Message, "OR") {
+		t.Errorf("expected the hint to suggest OR, got: %q", parsed.Message)
+	}
+}
+
+func TestMCPSearchHandlerEmptyResultNoHintForSingleTerm(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Directory = t.TempDir()
+	cache := NewSearchCache()
+	handler := mcpSearchHandler(&cfg, cache)
+
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{
+		"query": "loneterm",
+	}
+	result, err := handler(context.Background(), req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var parsed mcpSearchResponse
+	if err := json.Unmarshal([]byte(result.Content[0].(mcp.TextContent).Text), &parsed); err != nil {
+		t.Fatalf("result is not valid JSON: %v", err)
+	}
+	if parsed.Message != "" {
+		t.Errorf("expected no hint for a single-term query, got: %q", parsed.Message)
+	}
+}
+
 func TestMCPGetFileHandlerMissingPath(t *testing.T) {
 	cfg := DefaultConfig()
 	handler := mcpGetFileHandler(&cfg)
