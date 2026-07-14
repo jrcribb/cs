@@ -43,13 +43,22 @@ func DoSearch(ctx context.Context, cfg *Config, query string, cache *SearchCache
 	}
 
 	// Parse query into AST
+	defaultOp, err := cfg.ResolveDefaultOperator()
+	if err != nil {
+		close(out)
+		return out, stats, err
+	}
 	lexer := search.NewLexer(strings.NewReader(query))
-	parser := search.NewParser(lexer)
+	parser := search.NewParser(lexer, search.WithDefaultOperator(defaultOp))
 	ast, _ := parser.ParseQuery()
 	if ast == nil {
 		close(out)
 		return out, stats, nil
 	}
+
+	// Filters (path:, ext:, ...) constrain the whole query, so lift them out of
+	// any implicit OR grouping introduced by a default-or operator.
+	ast = search.HoistFilters(ast)
 
 	// Validate query term count
 	if cfg.MaxQueryTerms > 0 && search.CountAllTerms(ast) > cfg.MaxQueryTerms {
